@@ -2,6 +2,7 @@ import torch
 from torch.nn import Linear
 from torch_geometric.nn import SAGEConv
 from torch_geometric.data import Data
+from torch_geometric.utils import negative_sampling
 
 device = torch.device("cuda")
 
@@ -55,13 +56,46 @@ model = MyGraphModel(
     out_channels=64,
 ).to(device)
 
-out = model(graph.x, graph.edge_index)
-
-print(graph)
-
 decoder = EdgeDecoder(hidden_channels=64).to(device)
-scores = decoder(out, graph.edge_index)
-print("Edge scores:", scores)
+
+optimizer = torch.optim.Adam(list(model.parameters()) + list(decoder.parameters()), lr=0.01)
+
+# training loop
+print("Starting training...")
+for epoch in range(101): # Run 100 times
+    # forward
+    out = model(graph.x, graph.edge_index)
+
+    # positive edges (existing ones)
+    pos_edge_index = graph.edge_index
+    
+    # negative edges (non-existing ones)
+    neg_edge_index = negative_sampling(
+        edge_index=graph.edge_index, num_nodes=graph.num_nodes, num_neg_samples=pos_edge_index.size(1)
+    )
+
+    pos_scores = decoder(out, pos_edge_index)
+    neg_scores = decoder(out, neg_edge_index)
+
+# 1 for real edges, 0 for fake
+    pos_labels = torch.ones(pos_scores.size(0), 1).to(device)
+    neg_labels = torch.zeros(neg_scores.size(0), 1).to(device)
+
+    scores = torch.cat([pos_scores, neg_scores], dim=0)
+    labels = torch.cat([pos_labels, neg_labels], dim=0)
+
+    # loss
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss = loss_fn(scores, labels)
+
+    # backward
+    optimizer.zero_grad() 
+    loss.backward()       
+    optimizer.step()      
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+
 
 test_edge = torch.tensor([[3], [4]], dtype=torch.long).to(device)
 prediction = decoder(out, test_edge)
