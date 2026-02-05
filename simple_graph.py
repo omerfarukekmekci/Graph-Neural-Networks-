@@ -39,14 +39,39 @@ class EdgeDecoder(torch.nn.Module):
         return score
 
 
-x = torch.tensor([[1.0, 2.0], [7.0, 11.0], [3.0, 5.0], [15.0, 23.0], [31.0, 47.0]], dtype=torch.float)
-edge_index = (
-    torch.tensor(
-        [[0, 2, 1, 2, 1, 3], [2, 0, 2, 1, 3, 1]],
-        dtype=torch.long,
-    )
-    .contiguous()
-)
+x = torch.tensor([
+    [0.0, 0.0],    # node 0
+    [10.0, 10.0],  # node 1
+
+    [1.1, 0.9],    
+    [0.8, 1.2],    
+    [1.0, 1.0],   
+    [1.2, 0.7],    # node 5
+    [0.9, 1.1],    
+    [1.3, 1.0],    
+    [0.7, 0.8],    
+    [1.0, 1.3],    
+    [1.1, 1.2],    # node 10
+    [0.8, 1.0],    
+    [1.2, 1.1],    
+    [0.9, 0.7],    
+    [1.0, 0.9],    
+    [1.1, 1.0],    # node 15
+
+    [10.1, 9.9],   # node 16
+    [9.8, 10.2],   
+    [10.3, 10.1], 
+    [9.9, 9.7],    
+
+    [1.05, 0.95],  # node 20 (test node)
+], dtype=torch.float)
+
+edge_index = torch.tensor([
+    [0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0, 13, 0, 14, 0, 15, 0, 16] +
+    [1, 16, 1, 17, 1, 18, 1, 19],
+    [2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0, 13, 0, 14, 0, 15, 0, 16, 0] +
+    [16, 1, 17, 1, 18, 1, 19, 1]
+], dtype=torch.long)
 
 graph = Data(x=x, edge_index=edge_index).to(device)
 
@@ -97,6 +122,16 @@ for epoch in range(101): # Run 100 times
         print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
 
 
-test_edge = torch.tensor([[3], [4]], dtype=torch.long).to(device)
-prediction = decoder(out, test_edge)
-print(f"Score for edge 3->4: {prediction.item()}")
+model.eval()
+decoder.eval()
+
+with torch.no_grad():
+    out = model(graph.x, graph.edge_index)
+    
+    test_edge_0 = torch.tensor([[0], [20]], dtype=torch.long).to(device)
+    test_edge_1 = torch.tensor([[1], [20]], dtype=torch.long).to(device)
+
+    score_0 = decoder(out, test_edge_0)
+    score_1 = decoder(out, test_edge_1)
+
+    print(score_0.item(), score_1.item())
