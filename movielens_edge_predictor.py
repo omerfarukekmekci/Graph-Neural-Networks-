@@ -48,11 +48,19 @@ dataset = MovieLens(root='./data/MovieLens', model_name='all-MiniLM-L6-v2')
 
 data = dataset[0]
 
+movie_features = data['movie'].x
+feature_dim = movie_features.size(1)
+
+node_types = data.node_types
+movie_type_idx = node_types.index('movie')
+
 # merge user and movie nodes into a single set
 graph = data.to_homogeneous().to(device)
 
-# create random node features
-graph.x = torch.randn((graph.num_nodes, 64)).to(device)
+graph.x = torch.zeros(graph.num_nodes, feature_dim).to(device)
+movie_mask = (graph.node_type == movie_type_idx)
+graph.x[movie_mask] = movie_features.to(device)
+
 graph.edge_index = graph.edge_index.to(device)
 
 print(f"Graph loaded: {graph.num_nodes} nodes, {graph.num_edges} edges.")
