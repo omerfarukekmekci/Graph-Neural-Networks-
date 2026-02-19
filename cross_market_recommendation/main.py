@@ -8,7 +8,7 @@ from torch_geometric.nn import SAGEConv
 from torch_geometric.data import Data
 from torch_geometric.utils import negative_sampling
 from sentence_transformers import SentenceTransformer
-from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
 
@@ -25,15 +25,8 @@ print(f"\nLoading dataset from: {DATA_PATH}")
 cols_to_load = ["user_id", "item_id", "rating", "title", "category"]
 df = pd.read_parquet(DATA_PATH, columns=cols_to_load)
 
-# ==============================
-# SAMPLE THE DATASET
-# ==============================
-# The full dataset has 26.7M rows / 11.5M users — way too large.
-# The node feature matrix alone would be 11.7M × 384 × 4 bytes ≈ 18 GB.
-# MovieLens (which edge_predictor.py uses) has ~100K interactions.
-# We sample to keep RAM and training time reasonable.
-
-MAX_INTERACTIONS = 1_000_000  # adjust this based on your RAM (500K → ~1-2 GB)
+# sample the dataset
+MAX_INTERACTIONS = 2_000_000
 
 if len(df) > MAX_INTERACTIONS:
     print(f"\n  Dataset too large ({len(df):,} rows), sampling {MAX_INTERACTIONS:,} rows...")
@@ -184,3 +177,150 @@ class EdgeDecoder(torch.nn.Module):
         score = self.lin2(x)  # [num_pairs, 1] — raw logits (not probabilities)
 
         return score
+   
+NUM_EPOCHS = 75  
+HIDDEN_DIM = 64     
+LEARNING_RATE = 0.01
+
+loss_fn = torch.nn.BCEWithLogitsLoss()
+
+# split edges into 80% train / 20% validation
+all_edges = graph.edge_index.t().cpu().numpy()
+train_edges, val_edges = train_test_split(all_edges, test_size=0.2, random_state=42)
+
+train_edge_index = torch.tensor(train_edges.T, dtype=torch.long).to(device)
+val_edge_index = torch.tensor(val_edges.T, dtype=torch.long).to(device)
+
+print(f"\n  Training edges   : {train_edge_index.size(1):,}")
+print(f"  Validation edges : {val_edge_index.size(1):,}")
+
+model = MyGraphModel(
+    in_channels=graph.x.size(1),
+    hidden_channels=HIDDEN_DIM,
+    out_channels=HIDDEN_DIM,
+).to(device)
+
+decoder = EdgeDecoder(hidden_channels=HIDDEN_DIM).to(device)
+
+# Adam optimises both encoder and decoder.
+optimizer = torch.optim.Adam(
+    list(model.parameters()) + list(decoder.parameters()),
+    lr=LEARNING_RATE,
+)
+
+# TRAINING LOOP
+for epoch in range(NUM_EPOCHS + 1):
+    model.train()
+    decoder.train()
+
+    # forward pass
+    z = model(graph.x, train_edge_index)  # z shape: [num_nodes, 64]
+
+    # positive sampling
+    pos_edge_index = train_edge_index
+
+    # negative sampling
+    neg_edge_index = negative_sampling(
+        edge_index=graph.edge_index,
+        num_nodes=graph.num_nodes,
+        num_neg_samples=pos_edge_index.size(1),  # same count of negative edges as positives
+    )
+
+    # score the edges
+    # concatenate source & destination embeddings and pass them through a 2-layer MLP to get a single logit per edge.
+    pos_scores = decoder(z, pos_edge_index)  # [num_pos, 1]
+    neg_scores = decoder(z, neg_edge_index)  # [num_neg, 1]
+
+    # build labels: 1 for positive, 0 for negative
+    pos_labels = torch.ones(pos_scores.size(0), 1).to(device)
+    neg_labels = torch.zeros(neg_scores.size(0), 1).to(device)
+
+    # stack everything into one tensor for the loss function.
+    scores = torch.cat([pos_scores, neg_scores], dim=0)
+    labels = torch.cat([pos_labels, neg_labels], dim=0)
+
+    # compute loss, backpropagate, update weights
+    loss = loss_fn(scores, labels)
+    optimizer.zero_grad()   # reset gradients from previous step
+    loss.backward()         # computes gradients
+    optimizer.step()        # updates model weights based on the gradients and learning rate
+
+    if epoch % 10 == 0:
+        print(f"  Epoch {epoch:3d}/{NUM_EPOCHS}, Train Loss: {loss.item():.4f}")
+
+
+# VALIDATION
+model.eval()
+decoder.eval()
+
+with torch.no_grad():
+    z = model(graph.x, train_edge_index)
+
+    # score real (positive) validation edges
+    val_pos_scores = decoder(z, val_edge_index)
+
+    # score negative validation edges
+    val_neg_edge_index = negative_sampling(
+        edge_index=graph.edge_index,
+        num_nodes=graph.num_nodes,
+        num_neg_samples=val_edge_index.size(1),
+    )
+    val_neg_scores = decoder(z, val_neg_edge_index)
+
+    val_scores = torch.cat([val_pos_scores, val_neg_scores], dim=0)
+    val_labels = torch.cat([
+        torch.ones(val_pos_scores.size(0), 1),
+        torch.zeros(val_neg_scores.size(0), 1),
+    ], dim=0).to(device)
+
+    # Validation loss
+    val_loss = loss_fn(val_scores, val_labels).item()
+
+    # ROC-AUC
+    probs = torch.sigmoid(val_scores).cpu().numpy()
+    labels_np = val_labels.cpu().numpy()
+    auc = roc_auc_score(labels_np, probs)
+
+    print(f"\n  >> Validation Loss: {val_loss:.4f}, AUC: {auc:.4f}")
+
+
+# validation summary
+print(f"\n{'='*50}")
+print("VALIDATION RESULTS")
+print(f"{'='*50}")
+print(f"  Validation Loss : {val_loss:.4f}")
+print(f"  Validation AUC  : {auc:.4f}")
+
+if auc >= 0.9:
+    print(" Excellent — model separates positives and negatives very well.")
+elif auc >= 0.75:
+    print(" Good — solid predictive performance.")
+elif auc >= 0.6:
+    print(" Fair — better than random, but room for improvement.")
+else:
+    print(" Poor — model struggles to distinguish real from fake edges.")
+
+
+# example predictions
+print(f"\n{'='*50}")
+print("EXAMPLE EDGE PREDICTIONS")
+print(f"{'='*50}")
+
+with torch.no_grad():
+    z = model(graph.x, train_edge_index)
+
+    test_pairs = [
+        (0, num_users),
+        (0, num_users + 10),
+        (1, num_users + 50),
+        (5, num_users + 100),
+        (10, num_users + 200),
+    ]
+
+    for src, dst in test_pairs:
+        if src < graph.num_nodes and dst < graph.num_nodes:
+            test_edge = torch.tensor([[src], [dst]], dtype=torch.long).to(device)
+            score = torch.sigmoid(decoder(z, test_edge)).item()
+            verdict = "Likely connected" if score > 0.5 else "Unlikely connected"
+            print(f"  User {src} → Item {dst - num_users}: "
+                  f"Score = {score:.4f} ({verdict})")
