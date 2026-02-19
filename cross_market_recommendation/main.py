@@ -1,6 +1,7 @@
 import os
 import gc
 import torch
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from torch.nn import Linear
@@ -144,16 +145,18 @@ print(f"  User nodes:     0 .. {num_users-1}")
 print(f"  Item nodes:     {num_users} .. {num_nodes-1}")
 
 
-# input -> SAGEConv -> ReLU -> SAGEConv -> output
+# input -> SAGEConv -> ReLU -> Dropout -> SAGEConv -> output
 class MyGraphModel(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.2):
         super().__init__()
         self.conv1 = SAGEConv(in_channels, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, out_channels)
+        self.dropout = dropout
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
         x = torch.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)  # prevents overfitting
         x = self.conv2(x, edge_index)
         return x
 
@@ -174,13 +177,16 @@ class EdgeDecoder(torch.nn.Module):
 
         x = self.lin1(edge_feat)
         x = torch.relu(x)
+        x = F.dropout(x, p=0.3, training=self.training)  # prevents overfitting
         score = self.lin2(x)  # [num_pairs, 1] — raw logits (not probabilities)
 
         return score
    
-NUM_EPOCHS = 75  
-HIDDEN_DIM = 64     
+NUM_EPOCHS = 50
+HIDDEN_DIM = 48
 LEARNING_RATE = 0.01
+WEIGHT_DECAY = 1e-4     # L2 regularisation — penalises large weights
+PATIENCE = 10           # early stopping — stop if val_loss doesn't improve for this many epochs
 
 loss_fn = torch.nn.BCEWithLogitsLoss()
 
@@ -206,15 +212,19 @@ decoder = EdgeDecoder(hidden_channels=HIDDEN_DIM).to(device)
 optimizer = torch.optim.Adam(
     list(model.parameters()) + list(decoder.parameters()),
     lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,  # L2 regularisation to prevent overfitting
 )
 
-# TRAINING LOOP
+# TRAINING LOOP with early stopping
+best_val_loss = float('inf')
+epochs_without_improvement = 0
+
 for epoch in range(NUM_EPOCHS + 1):
     model.train()
     decoder.train()
 
     # forward pass
-    z = model(graph.x, train_edge_index)  # z shape: [num_nodes, 64]
+    z = model(graph.x, train_edge_index)  # z shape: [num_nodes, 48]
 
     # positive sampling
     pos_edge_index = train_edge_index
@@ -245,8 +255,44 @@ for epoch in range(NUM_EPOCHS + 1):
     loss.backward()         # computes gradients
     optimizer.step()        # updates model weights based on the gradients and learning rate
 
-    if epoch % 10 == 0:
-        print(f"  Epoch {epoch:3d}/{NUM_EPOCHS}, Train Loss: {loss.item():.4f}")
+    # early stopping: check validation loss every epoch
+    model.eval()
+    decoder.eval()
+    with torch.no_grad():
+        z_val = model(graph.x, train_edge_index)
+        vp_scores = decoder(z_val, val_edge_index)
+        vn_edge = negative_sampling(
+            edge_index=graph.edge_index,
+            num_nodes=graph.num_nodes,
+            num_neg_samples=val_edge_index.size(1),
+        )
+        vn_scores = decoder(z_val, vn_edge)
+        v_scores = torch.cat([vp_scores, vn_scores], dim=0)
+        v_labels = torch.cat([
+            torch.ones(vp_scores.size(0), 1),
+            torch.zeros(vn_scores.size(0), 1),
+        ], dim=0).to(device)
+        epoch_val_loss = loss_fn(v_scores, v_labels).item()
+
+    if epoch_val_loss < best_val_loss:
+        best_val_loss = epoch_val_loss
+        epochs_without_improvement = 0
+        # save the best model weights
+        best_model_state = model.state_dict()
+        best_decoder_state = decoder.state_dict()
+    else:
+        epochs_without_improvement += 1
+
+    if epoch % 5 == 0:
+        print(f"  Epoch {epoch:3d}/{NUM_EPOCHS}, Train Loss: {loss.item():.4f}, Val Loss: {epoch_val_loss:.4f}")
+
+    if epochs_without_improvement >= PATIENCE:
+        print(f"  Early stopping at epoch {epoch} (no improvement for {PATIENCE} epochs)")
+        break
+
+# restore best model weights
+model.load_state_dict(best_model_state)
+decoder.load_state_dict(best_decoder_state)
 
 
 # VALIDATION
