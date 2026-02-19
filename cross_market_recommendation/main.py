@@ -150,3 +150,37 @@ print(f"  Feature dim:    {feature_dim}")
 print(f"  User nodes:     0 .. {num_users-1}")
 print(f"  Item nodes:     {num_users} .. {num_nodes-1}")
 
+
+# input -> SAGEConv -> ReLU -> SAGEConv -> output
+class MyGraphModel(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = SAGEConv(in_channels, hidden_channels)
+        self.conv2 = SAGEConv(hidden_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = torch.relu(x)
+        x = self.conv2(x, edge_index)
+        return x
+
+
+class EdgeDecoder(torch.nn.Module):
+    def __init__(self, hidden_channels):
+        super().__init__()
+        self.lin1 = Linear(hidden_channels * 2, hidden_channels)
+        self.lin2 = Linear(hidden_channels, 1)
+
+    def forward(self, z, edge_index):
+        src, dst = edge_index
+        z_src = z[src]
+        z_dst = z[dst]
+
+        # concatenate source and destination embeddings
+        edge_feat = torch.cat([z_src, z_dst], dim=1)
+
+        x = self.lin1(edge_feat)
+        x = torch.relu(x)
+        score = self.lin2(x)  # [num_pairs, 1] — raw logits (not probabilities)
+
+        return score
