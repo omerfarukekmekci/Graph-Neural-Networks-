@@ -3,42 +3,54 @@ import gzip
 import json
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
 
-BASE_URL = "https://xmrec.github.io/data/us/"
-RAW_DIR = "data/xmrec/us/raw"
-OUTPUT_DIR = "data/xmrec/us"
+# ── All 18 XMRec markets ──────────────────────────────────────────────────────
+MARKETS = [
+    "ae", "au", "br", "ca", "cn", "de", "es", "fr",
+    "in", "it", "jp", "mx", "nl", "sa", "sg", "tr", "uk", "us",
+]
+
+# ── All 16 product categories ─────────────────────────────────────────────────
+CATEGORIES = [
+    "Arts_Crafts_and_Sewing",
+    "Automotive",
+    "Books",
+    "CDs_and_Vinyl",
+    "Cell_Phones_and_Accessories",
+    "Digital_Music",
+    "Electronics",
+    "Grocery_and_Gourmet_Food",
+    "Home_and_Kitchen",
+    "Industrial_and_Scientific",
+    "Kindle_Store",
+    "Movies_and_TV",
+    "Musical_Instruments",
+    "Office_Products",
+    "Sports_and_Outdoors",
+    "Toys_and_Games",
+]
+
+BASE_DOWNLOAD_URL = "https://ciir.cs.umass.edu/downloads/XMarket/FULL"
 
 
-def discover_links():
-    r = requests.get(BASE_URL)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+# ── URL construction (replaces BeautifulSoup scraping) ────────────────────────
 
+def build_urls(market):
+    """Build download URLs for every category in a given market.
+
+    Returns dict: {category: {"ratings": url, "reviews": url, "metadata": url}}
+    """
     categories = {}
-
-    for link in soup.find_all("a"):
-        href = link.get("href")
-        if not href or not href.endswith(".gz"):
-            continue
-
-        full_url = urljoin(BASE_URL, href)
-        filename = os.path.basename(urlparse(full_url).path)
-
-        # e.g. "ratings_us_Electronics.txt.gz" -> type="ratings", cat="Electronics"
-        parts = filename.replace(".txt.gz", "").replace(".json.gz", "").split("_us_")
-        if len(parts) != 2:
-            continue
-
-        file_type, category = parts[0], parts[1]
-
-        if category not in categories:
-            categories[category] = {}
-        categories[category][file_type] = full_url
-
+    for cat in CATEGORIES:
+        categories[cat] = {
+            "ratings":  f"{BASE_DOWNLOAD_URL}/{market}/{cat}/ratings_{market}_{cat}.txt.gz",
+            "reviews":  f"{BASE_DOWNLOAD_URL}/{market}/{cat}/reviews_{market}_{cat}.json.gz",
+            "metadata": f"{BASE_DOWNLOAD_URL}/{market}/{cat}/metadata_{market}_{cat}.json.gz",
+        }
     return categories
 
+
+# ── Download helper ───────────────────────────────────────────────────────────
 
 def download_file(url, dest_path):
     if os.path.exists(dest_path):
@@ -54,6 +66,8 @@ def download_file(url, dest_path):
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
 
+
+# ── Loaders ───────────────────────────────────────────────────────────────────
 
 def load_ratings(gz_path):
     rows = []
@@ -79,7 +93,6 @@ def load_json_gz(gz_path):
                 continue
             try:
                 parsed = json.loads(line)
-                # some files have a JSON array per line, others a single dict
                 if isinstance(parsed, list):
                     records.extend(parsed)
                 elif isinstance(parsed, dict):
@@ -89,16 +102,19 @@ def load_json_gz(gz_path):
     return pd.DataFrame(records)
 
 
-def process_category(category, urls):
+# ── Per-category processing ───────────────────────────────────────────────────
+
+def process_category(market, category, urls, raw_dir):
+    """Download and merge ratings/reviews/metadata for one category."""
     print(f"\n{'='*60}")
-    print(f"{category}")
+    print(f"  [{market.upper()}] {category}")
     print(f"{'='*60}")
 
-    cat_dir = os.path.join(RAW_DIR, category)
+    cat_dir = os.path.join(raw_dir, category)
 
     local_files = {}
     for file_type, url in urls.items():
-        filename = os.path.basename(urlparse(url).path)
+        filename = os.path.basename(url)
         dest = os.path.join(cat_dir, filename)
         download_file(url, dest)
         local_files[file_type] = dest
@@ -149,42 +165,64 @@ def process_category(category, urls):
     return ratings_df
 
 
-def main():
-    print("discovering XMRec US market datasets...")
-    categories = discover_links()
-    print(f"found {len(categories)} categories: {', '.join(categories.keys())}\n")
+# ── Per-market processing ─────────────────────────────────────────────────────
+
+def process_market(market):
+    """Download, process, and save all categories for one market."""
+    output_dir = f"data/xmrec/{market}"
+    raw_dir = os.path.join(output_dir, "raw")
+
+    print(f"\n{'#'*60}")
+    print(f"  MARKET: {market.upper()}")
+    print(f"{'#'*60}")
+
+    categories = build_urls(market)
+    print(f"  {len(categories)} categories")
 
     all_dfs = []
     for category, urls in categories.items():
-        df = process_category(category, urls)
+        df = process_category(market, category, urls, raw_dir)
         if df is not None:
             all_dfs.append(df)
 
     if not all_dfs:
-        print("\nno data was loaded")
+        print(f"\n  no data loaded for market {market}")
         return
 
     print(f"\n{'='*60}")
-    print("merging all categories...")
+    print(f"  [{market.upper()}] merging all categories...")
     print(f"{'='*60}")
 
     merged = pd.concat(all_dfs, ignore_index=True)
 
-    print(f"\nfinal dataset: {merged.shape}")
-    print(f"  {len(merged):,} interactions")
-    print(f"  {merged['user_id'].nunique():,} unique users")
-    print(f"  {merged['item_id'].nunique():,} unique items")
-    print(f"  {merged['category'].nunique()} categories")
-    print(f"  columns: {list(merged.columns)}")
+    print(f"\n  final dataset: {merged.shape}")
+    print(f"    {len(merged):,} interactions")
+    print(f"    {merged['user_id'].nunique():,} unique users")
+    print(f"    {merged['item_id'].nunique():,} unique items")
+    print(f"    {merged['category'].nunique()} categories")
+    print(f"    columns: {list(merged.columns)}")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, "xmrec_us_merged.parquet")
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"xmrec_{market}_merged.parquet")
     merged.to_parquet(out_path, index=False)
-    print(f"\nsaved to {out_path} ({os.path.getsize(out_path) / (1024**2):.1f} MB)")
+    print(f"\n  saved to {out_path} ({os.path.getsize(out_path) / (1024**2):.1f} MB)")
 
-    preview_path = os.path.join(OUTPUT_DIR, "xmrec_us_preview.csv")
+    preview_path = os.path.join(output_dir, f"xmrec_{market}_preview.csv")
     merged.head(100).to_csv(preview_path, index=False)
-    print(f"preview (100 rows) saved to {preview_path}")
+    print(f"  preview (100 rows) saved to {preview_path}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    print(f"XMRec dataset fetcher — {len(MARKETS)} markets × {len(CATEGORIES)} categories\n")
+
+    for market in MARKETS:
+        process_market(market)
+
+    print(f"\n{'#'*60}")
+    print("  ALL DONE")
+    print(f"{'#'*60}")
 
 
 if __name__ == "__main__":
